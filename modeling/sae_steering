@@ -1,0 +1,175 @@
+"""Diagnosis-preserving domain-aware steering in a Top-K SAE latent space.
+
+The domain probe is trained on detached SAE activations. Its weights estimate
+which latent dimensions are useful for source-domain discrimination, while an
+EMA of positive true-class-margin attribution estimates which dimensions support
+the current DR grade prediction. Only domain-sensitive dimensions with weak
+positive grade-margin contribution are softly attenuated.
+
+This is a feature-level intervention, not a guarantee of causal disentanglement.
+"""
+from __future__ import annotations
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+class DomainAwareSAESteering(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        num_domains: int,
+        num_classes: int,
+        enabled: bool = True,
+        strength: float = 0.5,
+        warmup_epochs: int = 5,
+        ramp_epochs: int = 5,
+        importance_momentum: float = 0.95,
+    ):
+        super().__init__()
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError(f"steering strength must be in [0, 1], got {strength}")
+        if warmup_epochs < 0 or ramp_epochs < 1:
+            raise ValueError("warmup_epochs must be >= 0 and ramp_epochs must be >= 1")
+        if not 0.0 <= importance_momentum < 1.0:
+            raise ValueError("importance_momentum must be in [0, 1)")
+        if num_domains < 1 or num_classes < 2:
+            raise ValueError("num_domains must be >= 1 and num_classes must be >= 2")
+
+        self.latent_dim = int(latent_dim)
+        self.num_domains = int(num_domains)
+        self.num_classes = int(num_classes)
+        self.enabled = bool(enabled)
+        self.strength = float(strength)
+        self.warmup_epochs = int(warmup_epochs)
+        self.ramp_epochs = int(ramp_epochs)
+        self.importance_momentum = float(importance_momentum)
+
+        # The probe is diagnostic only: it never back-propagates into the SAE.
+        self.domain_probe = nn.Linear(self.latent_dim, self.num_domains)
+        # Running estimate of features that positively support the true-grade
+        # logit margin in the actual downstream classifier.
+        self.register_buffer("grade_importance", torch.zeros(self.latent_dim))
+        self.register_buffer("domain_quality", torch.tensor(0.0))
+        self.register_buffer("steering_progress", torch.tensor(0.0))
+
+    def set_epoch(self, epoch: int) -> None:
+        """Warm up probes first, then ramp the steering strength gradually."""
+        if not self.enabled:
+            progress = 0.0
+        else:
+            progress = (float(epoch) - self.warmup_epochs) / self.ramp_epochs
+            progress = min(1.0, max(0.0, progress))
+        self.steering_progress.fill_(progress)
+
+    @staticmethod
+    def _robust_normalize(score: torch.Tensor) -> torch.Tensor:
+        score = torch.nan_to_num(score.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        if score.numel() == 0 or score.max() <= 1e-8:
+            return torch.zeros_like(score)
+        # Robust scaling prevents a single extreme feature from setting the
+        # scale for all other latent dimensions.
+        scale = torch.quantile(score.float(), 0.95).to(score.dtype)
+        if scale <= 1e-8:
+            return torch.zeros_like(score)
+        return (score / scale).clamp(0.0, 1.0)
+
+    def feature_scores(self):
+        """Return domain score, grade-support score, risk score, and soft gate."""
+        with torch.no_grad():
+            if not self.enabled:
+                zeros = self.grade_importance.new_zeros(self.latent_dim)
+                ones = self.grade_importance.new_ones(self.latent_dim)
+                return zeros, zeros, zeros, ones
+
+            weight = self.domain_probe.weight.detach()
+            # Center class weights so common offsets across domain classes do
+            # not count as domain-discriminative directions.
+            centered = weight - weight.mean(dim=0, keepdim=True)
+            domain_raw = centered.square().mean(dim=0).sqrt()
+            grade_raw = self.grade_importance.clamp_min(0.0)
+
+            domain_score = self._robust_normalize(domain_raw)
+            grade_score = self._robust_normalize(grade_raw)
+
+            # EXPOSE-inspired domain sensitivity, with a diagnosis-preserving
+            # safeguard: high domain score alone is insufficient for suppression.
+            # The quality factor avoids steering when the domain probe is near chance.
+            risk = domain_score * (1.0 - grade_score) * self.domain_quality.clamp(0.0, 1.0)
+            gate = 1.0 - self.strength * self.steering_progress * risk
+            gate = gate.clamp(min=1.0 - self.strength, max=1.0)
+        return domain_score, grade_score, risk, gate
+
+    def forward(self, activations: torch.Tensor) -> torch.Tensor:
+        """Softly attenuate selected SAE latents before semantic/variation MLPs."""
+        if not self.enabled:
+            return activations
+        _, _, _, gate = self.feature_scores()
+        return activations * gate.to(
+            device=activations.device, dtype=activations.dtype
+        ).unsqueeze(0)
+
+    @staticmethod
+    def _balanced_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Equalize total minibatch weight per class without requiring all classes."""
+        targets = targets.long().view(-1)
+        if targets.numel() == 0:
+            return logits.sum() * 0.0
+        counts = torch.bincount(targets, minlength=logits.shape[-1]).to(
+            device=logits.device, dtype=logits.dtype
+        )
+        sample_weights = counts[targets].clamp_min(1.0).reciprocal()
+        per_sample = F.cross_entropy(logits, targets, reduction="none")
+        return (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+
+    def domain_probe_loss(
+        self, activations: torch.Tensor, domains: torch.Tensor
+    ) -> torch.Tensor:
+        """Train a balanced domain probe using detached sparse activations."""
+        if not self.enabled or self.num_domains < 2:
+            return activations.sum() * 0.0
+        logits = self.domain_probe(activations.detach())
+        with torch.no_grad():
+            targets = domains.long().view(-1)
+            predictions = logits.argmax(dim=-1)
+            class_acc = []
+            for class_id in targets.unique():
+                selected = targets == class_id
+                class_acc.append((predictions[selected] == targets[selected]).float().mean())
+            if class_acc:
+                balanced_acc = torch.stack(class_acc).mean()
+                chance = 1.0 / max(1, len(class_acc))
+                quality = ((balanced_acc - chance) / max(1e-8, 1.0 - chance)).clamp(0.0, 1.0)
+                self.domain_quality.mul_(0.9).add_(quality.to(self.domain_quality), alpha=0.1)
+        return self._balanced_cross_entropy(logits, domains)
+
+    @torch.no_grad()
+    def update_grade_importance(self, positive_margin_attribution: torch.Tensor) -> None:
+        """EMA update from positive Gradient×Activation attribution to true-grade margin."""
+        if not self.enabled:
+            return
+        importance = positive_margin_attribution.detach().to(
+            device=self.grade_importance.device, dtype=self.grade_importance.dtype
+        ).clamp_min(0.0)
+        if not torch.isfinite(importance).all():
+            importance = torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.count_nonzero(self.grade_importance):
+            self.grade_importance.copy_(importance)
+        else:
+            self.grade_importance.mul_(self.importance_momentum).add_(
+                importance, alpha=1.0 - self.importance_momentum
+            )
+
+    @torch.no_grad()
+    def diagnostics(self) -> dict[str, float]:
+        domain_score, grade_score, risk, gate = self.feature_scores()
+        return {
+            "steer_gate_mean": float(gate.mean().item()),
+            "steer_suppressed_frac": float((gate < 0.99).float().mean().item()),
+            "steer_domain_score_mean": float(domain_score.mean().item()),
+            "steer_grade_score_mean": float(grade_score.mean().item()),
+            "steer_risk_mean": float(risk.mean().item()),
+            "steer_domain_quality": float(self.domain_quality.item()),
+            "steer_progress": float(self.steering_progress.item()),
+        }
