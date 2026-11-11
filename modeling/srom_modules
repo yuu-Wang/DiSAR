@@ -1,0 +1,148 @@
+"""Semantic/variation factorization and paired-view losses for GDRNetSROM.
+
+Notes:
+    - InfoNCE loss ``srom_separation_loss`` is a contrastive *proxy* for reducing
+      semantic/variation overlap. It does NOT estimate or minimize mutual
+      information I(s; v) in the information-theoretic sense.
+    - GDRNetSROM uses one shared image-space decoder for both crossed
+      semantic/variation reconstruction directions.
+"""
+from __future__ import annotations
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+class CrossFeatureDecoder(nn.Module):
+    """D(s, v) -> projected feature z."""
+
+    def __init__(self, semantic_dim=256, variation_dim=128,
+                 output_dim=512, hidden_dim=512):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(semantic_dim + variation_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, s, v):
+        return self.net(torch.cat([s, v], dim=-1))
+class ProjectionHead(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)
+
+
+class FactorMLP(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        return self.net(a)
+
+
+class CrossImageDecoder(nn.Module):
+    """D(s, v) -> [B, 3, H, W] in ImageNet-normalized image space.
+
+    The final bilinear resize only adapts spatial size: the decoder is trained
+    against x_1/x_2 (not SAE features). The 7->224 pathway is intentionally
+    lightweight and cannot guarantee faithful pixel-level pathology detail.
+    """
+    def __init__(self, semantic_dim: int = 256, variation_dim: int = 128):
+        super().__init__()
+        self.fc = nn.Linear(semantic_dim + variation_dim, 128 * 7 * 7)
+
+        def up(in_ch: int, out_ch: int):
+            return nn.Sequential(
+                nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1),
+                nn.GroupNorm(8, out_ch),
+                nn.SiLU(inplace=True),
+            )
+
+        self.net = nn.Sequential(
+            up(128, 96),  # 7 -> 14
+            up(96, 64),   # 14 -> 28
+            up(64, 32),   # 28 -> 56
+            up(32, 16),   # 56 -> 112
+            nn.ConvTranspose2d(16, 3, 4, stride=2, padding=1),  # 112 -> 224
+        )
+
+    def forward(self, s: torch.Tensor, v: torch.Tensor,
+                image_hw: tuple[int, int] | None = None) -> torch.Tensor:
+        latent = torch.cat([s, v], dim=-1)
+        x_hat = self.net(self.fc(latent).reshape(latent.shape[0], 128, 7, 7))
+        if image_hw is not None and x_hat.shape[-2:] != image_hw:
+            x_hat = F.interpolate(x_hat, size=image_hw, mode='bilinear', align_corners=False)
+        return x_hat
+
+
+def symmetric_infonce(z1: torch.Tensor, z2: torch.Tensor,
+                      tau: float = 0.1) -> torch.Tensor:
+    """Two paired views; the diagonal is the only positive in each direction."""
+    if tau <= 0:
+        raise ValueError('InfoNCE temperature must be positive.')
+    if z1.shape != z2.shape:
+        raise ValueError(f'View shapes must match, got {z1.shape} and {z2.shape}')
+    if z1.shape[0] < 2:
+        return (z1.sum() + z2.sum()) * 0.0
+    z1, z2 = F.normalize(z1, dim=-1), F.normalize(z2, dim=-1)
+    logits = z1 @ z2.T / tau
+    targets = torch.arange(z1.shape[0], device=z1.device)
+    return 0.5 * (F.cross_entropy(logits, targets) +
+                  F.cross_entropy(logits.T, targets))
+
+
+def _separation_one_way(anchor_s: torch.Tensor, pos_s: torch.Tensor,
+                        own_v: torch.Tensor, other_v: torch.Tensor,
+                        tau: float) -> torch.Tensor:
+    """Positive s_i--s_i+, negative s_i--s_j+, s_i--v_j+,
+    plus same-view s_i--v_i (j != i). Matches user's proposed L_min.
+    """
+    batch = anchor_s.shape[0]
+    s = F.normalize(anchor_s, dim=-1)
+    p = F.normalize(pos_s, dim=-1)
+    v_self = F.normalize(own_v, dim=-1)
+    v_other = F.normalize(other_v, dim=-1)
+    positive = (s * p).sum(dim=-1, keepdim=True) / tau
+    # Differing-image pairs only for semantic and cross-view variation negatives.
+    mask = torch.eye(batch, device=s.device, dtype=torch.bool)
+    neg_s = (s @ p.T / tau).masked_fill(mask, float('-inf'))
+    neg_v = (s @ v_other.T / tau).masked_fill(mask, float('-inf'))
+    same_view_v = (s * v_self).sum(dim=-1, keepdim=True) / tau
+    all_logits = torch.cat([positive, neg_s, neg_v, same_view_v], dim=1)
+    # -log(exp(positive)/sum(exp(all_logits))), stable under large logits.
+    return (torch.logsumexp(all_logits, dim=1) - positive.squeeze(1)).mean()
+
+
+def srom_separation_loss(s1: torch.Tensor, s2: torch.Tensor,
+                         v1_aligned: torch.Tensor, v2_aligned: torch.Tensor,
+                         tau: float = 0.2) -> torch.Tensor:
+    """Symmetric semantic-positive / variation-negative contrastive objective.
+
+    v*_aligned are learned projections into the semantic vector space.
+    A low value is *not* proof of statistical independence or zero MI.
+    """
+    if tau <= 0:
+        raise ValueError('Separation temperature must be positive.')
+    if s1.shape != s2.shape or s1.shape != v1_aligned.shape or s2.shape != v2_aligned.shape:
+        raise ValueError('All semantic/variation contrast vectors must have matching shapes.')
+    if s1.shape[0] < 2:
+        return (s1.sum() + s2.sum()) * 0.0
+    return 0.5 * (
+        _separation_one_way(s1, s2, v1_aligned, v2_aligned, tau) +
+        _separation_one_way(s2, s1, v2_aligned, v1_aligned, tau)
+    )
