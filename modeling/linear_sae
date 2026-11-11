@@ -1,0 +1,81 @@
+"""TopK Linear Sparse Autoencoder for GDRNet pooled image features.
+
+Input h: [B, d_in]; sparse latent z: [B, d_sae].
+No polynomial decoder and no interaction residual.
+"""
+import torch
+import torch.nn as nn
+
+
+class DRLinearSAE(nn.Module):
+    def __init__(self, d_in=2048, d_sae=4096, k=64, decoder_init_norm=0.1):
+        super().__init__()
+        if not 1 <= k <= d_sae:
+            raise ValueError(f"top-k must satisfy 1 <= k <= d_sae, got {k} vs {d_sae}")
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.k = k
+
+        self.b_dec = nn.Parameter(torch.zeros(d_in))
+        self.b_enc = nn.Parameter(torch.zeros(d_sae))
+
+        W_dec = torch.empty(d_sae, d_in)
+        nn.init.kaiming_uniform_(W_dec)
+        if decoder_init_norm is not None:
+            W_dec = W_dec / W_dec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            W_dec = W_dec * decoder_init_norm
+        self.W_dec = nn.Parameter(W_dec)
+        self.W_enc = nn.Parameter(W_dec.t().clone().contiguous())
+
+    def encode(self, h):
+        hidden_pre = (h - self.b_dec) @ self.W_enc + self.b_enc
+        values, indices = torch.topk(hidden_pre, k=self.k, dim=-1, sorted=False)
+        values = values.relu()
+        z = torch.zeros_like(hidden_pre)
+        z.scatter_(-1, indices, values)
+        return z
+
+    def decode(self, z):
+        return z @ self.W_dec + self.b_dec
+
+    def forward(self, h):
+        z = self.encode(h)
+        recon = self.decode(z)
+        return recon, z
+
+class DRTopKSAEEncoder(nn.Module):
+    """Encoder-only TopK sparse coding module for GDRNetSROM.
+
+    It produces sparse activations without reconstructing the projected feature.
+    The image-level cross decoder is the only decoder used by GDRNetSROM.
+    """
+    def __init__(self, d_in=2048, d_sae=4096, k=64, encoder_init_norm=0.1):
+        super().__init__()
+        if not 1 <= k <= d_sae:
+            raise ValueError(f"top-k must satisfy 1 <= k <= d_sae, got {k} vs {d_sae}")
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.k = k
+
+        self.b_in = nn.Parameter(torch.zeros(d_in))
+        self.b_enc = nn.Parameter(torch.zeros(d_sae))
+
+        # Match the initialization scale of the encoder in DRLinearSAE.
+        W_enc = torch.empty(d_sae, d_in)
+        nn.init.kaiming_uniform_(W_enc)
+        if encoder_init_norm is not None:
+            W_enc = W_enc / W_enc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            W_enc = W_enc * encoder_init_norm
+        self.W_enc = nn.Parameter(W_enc.t().clone().contiguous())
+
+    def encode(self, h):
+        hidden_pre = (h - self.b_in) @ self.W_enc + self.b_enc
+        values, indices = torch.topk(hidden_pre, k=self.k, dim=-1, sorted=False)
+        values = values.relu()
+        z = torch.zeros_like(hidden_pre)
+        z.scatter_(-1, indices, values)
+        return z
+
+    def forward(self, h):
+        return self.encode(h)
+
